@@ -1,0 +1,85 @@
+{
+  "items": [
+    {
+      "hostname": "KBN0097",
+      "software_name": "Seqrite Endpoint Security Client 7.6",
+      "software_version": "7.6"
+    },
+    {
+      "hostname": "KBN0101",
+      "software_name": "Seqrite Endpoint Security Client 7.6",
+      "software_version": "7.6"
+    },
+    {
+      "hostname": "KBN0125",
+      "software_name": "Seqrite Endpoint Security Client 7.6",
+      "software_version": "7.6"
+    },
+    {
+      "hostname": "TNL0757",
+      "software_name": "Seqrite Endpoint Security Client 7.6",
+      "software_version": "7.6"
+    },
+    {
+      "hostname": "TNL0905",
+      "software_name": "Seqrite Endpoint Security Client 7.6",
+      "software_version": "7.6"
+    },
+    {
+      "hostname": "TNL1129",
+      "software_name": "Seqrite Endpoint Security Client 7.6",
+      "software_version": "7.6"
+    },
+    {
+      "hostname": "TNL1227",
+      "software_name": "Seqrite Endpoint Security Client 7.6",
+      "software_version": "7.6"
+    },
+    {
+      "hostname": "TNL1326",
+      "software_name": "Seqrite Endpoint Security Client 7.6",
+      "software_version": "7.6"
+    },
+    {
+      "hostname": "TNL1430",
+      "software_name": "Seqrite Endpoint Security Client 7.6",
+      "software_version": "7.6"
+    },
+    {
+      "hostname": "TNL-SRV_11",
+      "software_name": "Seqrite Endpoint Security Client 7.6",
+      "software_version": "7.6"
+    },
+    {
+      "hostname": "TNL-SRV_161",
+      "software_name": "Seqrite Endpoint Security Client 7.6",
+      "software_version": "7.6"
+    },
+    {
+      "hostname": "TNL-SRV_162",
+      "software_name": "Seqrite Endpoint Security Client 7.6",
+      "software_version": "7.6"
+    },
+    {
+      "hostname": "TNL-SRV_163",
+      "software_name": "Seqrite Endpoint Security Client 7.6",
+      "software_version": "7.6"
+    },
+    {
+      "hostname": "TNL-SRV_164",
+      "software_name": "Seqrite Endpoint Security Client 7.6",
+      "software_version": "7.6"
+    },
+    {
+      "hostname": "TNL-SRV_165",
+      "software_name": "Seqrite Endpoint Security Client 7.6",
+      "software_version": "7.6"
+    }
+  ],
+  "total": 15,
+  "limit": 500,
+  "offset": 0,
+  "query": "Seqrite Endpoint Security Client 7.6",
+  "version": null,
+  "read_only": true
+}

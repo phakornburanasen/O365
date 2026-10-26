@@ -1,0 +1,419 @@
+คู่มือการตั้งค่าและเพิ่ม MCP Server สำหรับ Codex
+ปรับปรุงล่าสุด: 6 สิงหาคม 2026
+
+======================================================================
+1. การตั้งค่า O365 License MCP ในโปรเจกต์นี้
+======================================================================
+
+พอร์ต Streamable HTTP ของ O365 License MCP ถูกกำหนดเป็น 20000 แล้วใน:
+
+1) FastMCP/server.py
+   ค่าเริ่มต้น: MCP_PORT=20000
+
+2) FastMCP/.env.example
+   MCP_PORT=20000
+
+หากมีไฟล์ FastMCP/.env ให้ตรวจสอบหรือแก้เป็น:
+
+MCP_TRANSPORT=streamable-http
+MCP_HOST=127.0.0.1
+MCP_PORT=20000
+
+คำสั่งเริ่มเซิร์ฟเวอร์จาก PowerShell ที่ project root:
+
+FastMCP\.venv\Scripts\python.exe FastMCP\server.py
+
+URL สำหรับเชื่อมต่อแบบ Streamable HTTP:
+
+http://127.0.0.1:20000/mcp
+
+ข้อสำคัญ:
+- MCP_PORT มีผลเฉพาะเมื่อ MCP_TRANSPORT=streamable-http
+- ถ้า MCP_TRANSPORT=stdio ตัว Client จะเปิด server.py เป็น subprocess โดยตรง
+  จึงไม่ใช้ TCP port และการเปลี่ยนพอร์ตจะไม่กระทบการเชื่อมต่อแบบ stdio
+- การตั้งค่าปัจจุบันของ o365-license ใน Codex เครื่องนี้เป็นแบบ stdio
+
+======================================================================
+2. ตำแหน่งไฟล์ตั้งค่า MCP ของ Codex
+======================================================================
+
+Codex รองรับไฟล์ config.toml สองระดับ:
+
+A) ระดับผู้ใช้ ใช้ได้กับทุกโปรเจกต์
+
+C:\Users\<ชื่อผู้ใช้>\.codex\config.toml
+
+เครื่องนี้ใช้ไฟล์:
+
+C:\Users\user\.codex\config.toml
+
+B) ระดับโปรเจกต์ ใช้เฉพาะโปรเจกต์นั้น
+
+<project-root>\.codex\config.toml
+
+สำหรับโปรเจกต์นี้คือ:
+
+C:\inetpub\wwwroot\O365\.codex\config.toml
+
+หมายเหตุ:
+- Project config จะถูกโหลดเฉพาะเมื่อโปรเจกต์ได้รับการ Trust แล้ว
+- ถ้าต้องการใช้ MCP Server ทุกโปรเจกต์ ให้เพิ่มใน config ระดับผู้ใช้
+- ถ้าต้องการจำกัดเฉพาะระบบนี้ ให้เพิ่มใน project config
+- Codex Desktop, Codex CLI และ IDE extension ที่ใช้ Codex host เดียวกัน
+  ใช้ MCP configuration ร่วมกัน
+
+======================================================================
+3. เลือกรูปแบบการเชื่อมต่อ
+======================================================================
+
+มี 2 รูปแบบหลัก
+
+3.1 STDIO เหมาะสำหรับ MCP ที่อยู่ในเครื่องเดียวกัน
+
+ข้อดี:
+- ตั้งค่าง่าย
+- ไม่ต้องเปิดพอร์ต
+- ไม่ต้องดูแล HTTP authentication
+- Codex เริ่มและหยุด process ให้ตามการใช้งาน
+
+ตัวอย่าง config.toml:
+
+[mcp_servers.o365-license]
+command = 'C:\inetpub\wwwroot\O365\FastMCP\.venv\Scripts\python.exe'
+args = ['C:\inetpub\wwwroot\O365\FastMCP\server.py']
+cwd = 'C:\inetpub\wwwroot\O365\FastMCP'
+startup_timeout_sec = 30
+tool_timeout_sec = 60
+enabled = true
+
+สามารถส่ง environment variables ให้ process ได้ดังนี้:
+
+[mcp_servers.o365-license.env]
+MCP_TRANSPORT = "stdio"
+APP_ENV = "production"
+
+อย่าใส่ password หรือ token ลง config ที่ commit เข้า Git
+ควรเก็บ secret ใน environment variable หรือ secret manager
+
+3.2 Streamable HTTP เหมาะสำหรับ server ที่รันแยก process หรือคนละเครื่อง
+
+ฝั่ง MCP Server ต้องรันด้วยค่าประมาณนี้:
+
+MCP_TRANSPORT=streamable-http
+MCP_HOST=127.0.0.1
+MCP_PORT=20000
+
+ฝั่ง Codex เพิ่มใน config.toml:
+
+[mcp_servers.o365-license-http]
+url = "http://127.0.0.1:20000/mcp"
+startup_timeout_sec = 30
+tool_timeout_sec = 60
+enabled = true
+
+ถ้า server ใช้ Bearer token ให้เก็บ token ใน environment variable เช่น:
+
+[mcp_servers.internal-system]
+url = "https://mcp.example.com/mcp"
+bearer_token_env_var = "INTERNAL_MCP_TOKEN"
+
+จากนั้นกำหนด INTERNAL_MCP_TOKEN ใน environment ของเครื่องที่รัน Codex
+
+ถ้าต้องส่ง HTTP header จาก environment variable:
+
+[mcp_servers.internal-system]
+url = "https://mcp.example.com/mcp"
+env_http_headers = { "X-API-Key" = "INTERNAL_MCP_API_KEY" }
+
+ไม่แนะนำให้เขียน token จริงไว้ใน http_headers หรือ commit ลง Git
+
+======================================================================
+4. ขั้นตอนเพิ่ม MCP Server ระบบใหม่แบบละเอียด
+======================================================================
+
+ขั้นที่ 1: กำหนดขอบเขตของระบบ
+
+- ตั้งชื่อ server ให้สั้นและไม่ซ้ำ เช่น hr-system, inventory หรือ crm
+- ระบุว่าเครื่องมือใดเป็น read-only และเครื่องมือใดสามารถแก้ไขข้อมูล
+- กำหนดระบบต้นทาง เช่น REST API, PostgreSQL, SQL Server หรือไฟล์
+- กำหนดสิทธิ์บัญชี service account ตามหลัก least privilege
+- ถ้า AI ต้องอ่านอย่างเดียว ให้บัญชีฐานข้อมูลมีเฉพาะ SELECT
+
+ขั้นที่ 2: สร้างโฟลเดอร์แยกสำหรับ MCP Server
+
+ตัวอย่าง:
+
+New-Item -ItemType Directory C:\inetpub\wwwroot\MCP\HrMCP
+py -3.11 -m venv C:\inetpub\wwwroot\MCP\HrMCP\.venv
+C:\inetpub\wwwroot\MCP\HrMCP\.venv\Scripts\python.exe -m pip install "mcp[cli]" python-dotenv
+
+ควรมีไฟล์อย่างน้อย:
+
+HrMCP\
+  server.py
+  requirements.txt
+  .env.example
+  .gitignore
+  README.md
+
+ไฟล์ .gitignore ควรมี:
+
+.env
+.venv/
+__pycache__/
+*.pyc
+
+ขั้นที่ 3: สร้าง MCP Server และประกาศ tools
+
+ตัวอย่าง server.py ขั้นต่ำ:
+
+import os
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP(
+    "HR MCP",
+    instructions="Read-only access to HR data.",
+    host=os.getenv("MCP_HOST", "127.0.0.1"),
+    port=int(os.getenv("MCP_PORT", "20001")),
+    stateless_http=True,
+    json_response=True,
+)
+
+@mcp.tool()
+def get_employee(employee_id: str) -> dict:
+    # เรียกฐานข้อมูลหรือ API จริง แล้วคืนค่าเป็น dict
+    return {"employee_id": employee_id}
+
+if __name__ == "__main__":
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    mcp.run(transport=transport)
+
+หลักการออกแบบ tool:
+- ชื่อ tool ต้องสื่อความหมาย เช่น get_employee, search_orders
+- description/docstring ต้องอธิบาย input, output และข้อจำกัดชัดเจน
+- validate input ทุกครั้ง
+- จำกัดจำนวนผลลัพธ์และรองรับ pagination เมื่อข้อมูลมีจำนวนมาก
+- อย่าเปิด tool ที่รับ raw SQL จาก AI
+- write tool ควรมี validation, audit log และ idempotency
+- แยก credential ของแต่ละระบบ ไม่ใช้บัญชี admin
+
+ขั้นที่ 4: สร้างไฟล์ environment ของ server
+
+ตัวอย่าง .env.example:
+
+MCP_TRANSPORT=stdio
+MCP_HOST=127.0.0.1
+MCP_PORT=20001
+API_BASE_URL=https://hr-api.example.internal
+API_TOKEN=
+
+คัดลอกเป็น .env แล้วใส่ค่าจริงเฉพาะเครื่อง:
+
+Copy-Item C:\inetpub\wwwroot\MCP\HrMCP\.env.example C:\inetpub\wwwroot\MCP\HrMCP\.env
+
+ห้าม commit ไฟล์ .env ที่มี secret
+
+ขั้นที่ 5: ทดสอบ server โดยตรง
+
+สำหรับ stdio:
+
+C:\inetpub\wwwroot\MCP\HrMCP\.venv\Scripts\python.exe C:\inetpub\wwwroot\MCP\HrMCP\server.py
+
+สำหรับ MCP Inspector:
+
+npx -y @modelcontextprotocol/inspector C:\inetpub\wwwroot\MCP\HrMCP\.venv\Scripts\python.exe C:\inetpub\wwwroot\MCP\HrMCP\server.py
+
+สำหรับ Streamable HTTP ให้ตั้ง MCP_TRANSPORT=streamable-http ก่อนรัน แล้วตรวจพอร์ต:
+
+Get-NetTCPConnection -LocalPort 20001 -State Listen
+
+ใช้ port ที่ไม่ซ้ำกับระบบอื่น เช่น 20001, 20002, 20003
+
+ขั้นที่ 6: ลงทะเบียน server กับ Codex
+
+วิธี A - แก้ config.toml โดยตรงสำหรับ stdio:
+
+[mcp_servers.hr-system]
+command = 'C:\inetpub\wwwroot\MCP\HrMCP\.venv\Scripts\python.exe'
+args = ['C:\inetpub\wwwroot\MCP\HrMCP\server.py']
+cwd = 'C:\inetpub\wwwroot\MCP\HrMCP'
+startup_timeout_sec = 30
+tool_timeout_sec = 60
+enabled = true
+
+วิธี B - แก้ config.toml โดยตรงสำหรับ Streamable HTTP:
+
+[mcp_servers.hr-system]
+url = "http://127.0.0.1:20001/mcp"
+startup_timeout_sec = 30
+tool_timeout_sec = 60
+enabled = true
+
+วิธี C - เพิ่ม stdio ด้วย Codex CLI:
+
+codex mcp add hr-system -- C:\inetpub\wwwroot\MCP\HrMCP\.venv\Scripts\python.exe C:\inetpub\wwwroot\MCP\HrMCP\server.py
+
+ตรวจสอบคำสั่งและ options รุ่นที่ติดตั้งในเครื่องด้วย:
+
+codex mcp --help
+codex mcp list
+
+วิธี D - เพิ่มผ่าน Codex Desktop:
+
+1) เปิด Settings
+2) เลือก MCP servers
+3) เลือก Add server
+4) ตั้งชื่อ server
+5) เลือก STDIO หรือ Streamable HTTP
+6) กรอก command/arguments หรือ URL
+7) Save
+8) เลือก Restart
+
+ขั้นที่ 7: Restart และตรวจสอบใน Codex
+
+- Restart Codex Desktop หรือ Restart extension
+- เปิด task ใหม่เพื่อให้โหลดรายการ tools ใหม่
+- ใน Codex CLI/TUI ใช้ /mcp เพื่อดู server ที่เชื่อมต่อ
+- ใช้ codex mcp list เพื่อตรวจรายการที่บันทึกไว้
+- ทดลองเรียก tool แบบอ่านข้อมูลหนึ่งรายการ
+- ตรวจว่า error, timeout และ permission ทำงานตามที่ออกแบบ
+
+ขั้นที่ 8: จำกัด tools และกำหนด approval policy
+
+ตัวอย่างอนุญาตเฉพาะบาง tools:
+
+[mcp_servers.hr-system]
+command = 'C:\inetpub\wwwroot\MCP\HrMCP\.venv\Scripts\python.exe'
+args = ['C:\inetpub\wwwroot\MCP\HrMCP\server.py']
+enabled_tools = ["get_employee", "search_employees"]
+default_tools_approval_mode = "writes"
+
+ค่าที่ใช้ได้สำหรับ default_tools_approval_mode:
+
+- auto: ให้ Codex จัดการตาม metadata และ policy
+- prompt: ขออนุมัติก่อนเรียก tool
+- writes: ขออนุมัติ tool ที่ไม่ได้ประกาศว่า read-only
+- approve: อนุมัติโดยค่าเริ่มต้นตาม policy ที่อนุญาต
+
+สามารถกำหนดเป็นราย tool ได้:
+
+[mcp_servers.hr-system.tools.update_employee]
+approval_mode = "prompt"
+
+ขั้นที่ 9: จัดการ OAuth กรณี remote server รองรับ
+
+- เพิ่ม server URL ใน config.toml
+- ใช้คำสั่ง codex mcp login <server-name>
+- ทำขั้นตอน sign-in ใน browser
+- Restart Codex หลัง authentication ถ้ารายการ tools ยังไม่ขึ้น
+
+ถ้าผู้ให้บริการกำหนด OAuth callback port ตายตัว สามารถตั้งค่าระดับบนสุด:
+
+mcp_oauth_callback_port = 5555
+
+ค่านี้เป็น OAuth callback port ไม่ใช่พอร์ตของ MCP Server
+
+ขั้นที่ 10: ตรวจสอบก่อนใช้งานจริง
+
+- ทดสอบทุก tool ด้วย input ปกติและ input ผิดรูปแบบ
+- ทดสอบกรณีระบบต้นทางล่มหรือ timeout
+- ยืนยันว่า read-only tool แก้ไขข้อมูลไม่ได้จริง
+- ยืนยันว่า log ไม่บันทึก password, token หรือข้อมูลอ่อนไหวเกินจำเป็น
+- ตรวจ dependency ด้วยวิธีขององค์กร
+- สำรอง config.toml ก่อนแก้ไขครั้งใหญ่
+- ใช้ HTTPS และ authentication หากเปิดใช้งานข้ามเครื่อง
+- ไม่ bind เป็น 0.0.0.0 โดยไม่มี firewall, TLS และ authentication
+
+======================================================================
+5. ตัวอย่าง config รวมหลาย MCP Servers
+======================================================================
+
+# O365 License: local stdio
+[mcp_servers.o365-license]
+command = 'C:\inetpub\wwwroot\O365\FastMCP\.venv\Scripts\python.exe'
+args = ['C:\inetpub\wwwroot\O365\FastMCP\server.py']
+cwd = 'C:\inetpub\wwwroot\O365\FastMCP'
+enabled = true
+
+# HR: local Streamable HTTP
+[mcp_servers.hr-system]
+url = "http://127.0.0.1:20001/mcp"
+enabled = true
+startup_timeout_sec = 30
+tool_timeout_sec = 60
+
+# Inventory: remote Streamable HTTP พร้อม Bearer token จาก environment
+[mcp_servers.inventory]
+url = "https://inventory.example.internal/mcp"
+bearer_token_env_var = "INVENTORY_MCP_TOKEN"
+enabled = true
+default_tools_approval_mode = "writes"
+
+MCP Server แต่ละตัวต้องใช้ชื่อไม่ซ้ำกัน และ HTTP server แต่ละ process
+ต้องใช้พอร์ตไม่ซ้ำกัน
+
+======================================================================
+6. Checklist เมื่อเพิ่ม MCP Server ใหม่
+======================================================================
+
+[ ] ตั้งชื่อ server ไม่ซ้ำ
+[ ] เลือก stdio หรือ Streamable HTTP
+[ ] สร้าง virtual environment แยก
+[ ] pin dependency version ใน requirements.txt
+[ ] สร้าง .env.example และเพิ่ม .env ใน .gitignore
+[ ] ใช้ service account ที่มีสิทธิ์เท่าที่จำเป็น
+[ ] ไม่เปิด raw SQL หรือ arbitrary command เป็น tool
+[ ] ใส่ input validation และ limit/pagination
+[ ] ประกาศ tool metadata ว่า read-only/write ให้ถูกต้อง
+[ ] ทดสอบด้วย MCP Inspector
+[ ] เพิ่ม [mcp_servers.<name>] ใน config.toml
+[ ] ตั้ง enabled_tools/approval policy ตามความเสี่ยง
+[ ] Restart Codex และตรวจด้วย /mcp หรือ codex mcp list
+[ ] ทดลอง tool อย่างน้อยหนึ่งครั้ง
+[ ] ตรวจ log, timeout, authentication และ failure behavior
+[ ] หากใช้ HTTP ข้ามเครื่อง ต้องมี HTTPS, authentication และ firewall
+
+======================================================================
+7. Troubleshooting
+======================================================================
+
+Server ไม่ปรากฏใน Codex:
+- ตรวจ syntax ของ config.toml
+- ตรวจว่าแก้ไฟล์ระดับผู้ใช้หรือระดับโปรเจกต์ถูกตำแหน่ง
+- ถ้าใช้ project config ให้ Trust โปรเจกต์ก่อน
+- Restart Codex/IDE extension และเปิด task ใหม่
+- ใช้ codex mcp list และ /mcp ตรวจสถานะ
+
+stdio เริ่มไม่ได้:
+- ตรวจ path ของ python.exe และ server.py
+- ใช้ absolute path
+- ลองรัน command เดียวกันใน PowerShell
+- เพิ่ม startup_timeout_sec หาก import หรือเชื่อมระบบต้นทางช้า
+- ตรวจว่าห้ามเขียนข้อความ debug ลง stdout เพราะ stdout ใช้ส่ง MCP protocol
+  ให้ส่ง log ไป stderr หรือ logging file แทน
+
+HTTP เชื่อมไม่ได้:
+- ตรวจ MCP_TRANSPORT=streamable-http
+- ตรวจ URL ลงท้าย /mcp
+- ตรวจว่าพอร์ตถูกใช้งานหรือไม่ด้วย Get-NetTCPConnection
+- ตรวจ firewall และ reverse proxy
+- ตรวจ bearer token/OAuth และเวลาของเครื่อง
+- localhost ใช้ได้เฉพาะ client ที่อยู่เครื่องเดียวกัน
+
+Tool timeout:
+- ปรับ tool_timeout_sec เฉพาะเมื่อจำเป็น
+- เพิ่ม pagination และลดขนาดผลลัพธ์
+- ตรวจ query/index/API latency ของระบบต้นทาง
+
+======================================================================
+8. เอกสารอ้างอิงทางการ
+======================================================================
+
+Codex MCP configuration:
+https://learn.chatgpt.com/docs/extend/mcp
+
+Codex configuration reference:
+https://learn.chatgpt.com/docs/config-file/config-reference
+
+Model Context Protocol:
+https://modelcontextprotocol.io/

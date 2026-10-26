@@ -1,0 +1,1228 @@
+import mimetypes
+import os
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from psycopg2.extras import RealDictCursor
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+
+try:
+    # Package import (for gunicorn: backend.app:app)
+    from .database import get_db_connection
+except ImportError:
+    # Direct execution (python backend/app.py)
+    from database import get_db_connection
+
+app = Flask(__name__)
+# ปรับ origins ตามที่คุณรัน frontend
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+BACKEND_DIR = Path(__file__).resolve().parent
+REPORT_UPLOAD_ROOT = BACKEND_DIR / "uploads" / "report_files"
+ALLOWED_REPORT_EXTENSIONS = {
+    ".pdf": "pdf",
+    ".xls": "excel",
+    ".xlsx": "excel",
+}
+REPORT_FILE_CONFIG = {
+    "price-renew-history": {
+        "table": "price_renew_o365",
+        "folder": "price_renew_history",
+        "prefix": "price_renew_history",
+        "title": "Price & Renew History",
+        "select_columns": [
+            "id",
+            "price",
+            "type",
+            "detail",
+            "year",
+            "file_type",
+            "note",
+            "created_at",
+        ],
+        "search_columns": ["detail", "note", "type", "price::text", "year::text"],
+        "requires_type": True,
+        "has_price": True,
+    },
+    "renewal-summary": {
+        "table": "renewal_summary_o365",
+        "folder": "renewal_summary",
+        "prefix": "renewal_summary",
+        "title": "Renewal Summary",
+        "select_columns": [
+            "id",
+            "detail",
+            "year",
+            "file_type",
+            "note",
+            "created_at",
+        ],
+        "search_columns": ["detail", "note", "year::text"],
+        "requires_type": False,
+        "has_price": False,
+    },
+}
+
+
+def get_report_file_config(report_key: str):
+    return REPORT_FILE_CONFIG.get((report_key or "").strip().lower())
+
+
+def normalize_optional_text(value):
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def parse_optional_int(value, field_name: str):
+    if value in (None, ""):
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} ต้องเป็นตัวเลข")
+
+
+def parse_optional_price(value):
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value).strip())
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError("price ไม่ถูกต้อง")
+
+
+def get_request_payload():
+    if request.files or (request.content_type and "multipart/form-data" in request.content_type):
+        return request.form
+    return request.get_json(silent=True) or {}
+
+
+def infer_file_type_from_filename(filename: str):
+    suffix = Path(filename or "").suffix.lower()
+    return ALLOWED_REPORT_EXTENSIONS.get(suffix), suffix
+
+
+def resolve_report_upload(file_storage, declared_file_type=None):
+    if not file_storage or not getattr(file_storage, "filename", ""):
+        raise ValueError("กรุณาเลือกไฟล์")
+    inferred_type, suffix = infer_file_type_from_filename(file_storage.filename)
+    if not inferred_type:
+        raise ValueError("รองรับเฉพาะไฟล์ PDF, XLS และ XLSX")
+    declared = normalize_optional_text(declared_file_type)
+    if declared and declared not in {"pdf", "excel"}:
+        raise ValueError("file_type ต้องเป็น pdf หรือ excel")
+    if declared and declared != inferred_type:
+        raise ValueError("ประเภทไฟล์ไม่ตรงกับไฟล์ที่อัปโหลด")
+    return inferred_type, suffix
+
+
+def get_report_item_file_path(report_key: str, item_id: int):
+    config = get_report_file_config(report_key)
+    if not config or item_id in (None, ""):
+        return None
+    folder = REPORT_UPLOAD_ROOT / config["folder"]
+    if not folder.exists():
+        return None
+    matches = sorted(folder.glob(f"{item_id}.*"))
+    return matches[0] if matches else None
+
+
+def remove_report_item_file(report_key: str, item_id: int):
+    file_path = get_report_item_file_path(report_key, item_id)
+    if file_path and file_path.exists():
+        file_path.unlink()
+
+
+def save_report_item_file(report_key: str, item_id: int, file_storage, suffix: str):
+    config = get_report_file_config(report_key)
+    if not config:
+        raise ValueError("ไม่พบประเภทข้อมูลรายงาน")
+    folder = REPORT_UPLOAD_ROOT / config["folder"]
+    folder.mkdir(parents=True, exist_ok=True)
+    remove_report_item_file(report_key, item_id)
+    file_path = folder / f"{item_id}{suffix.lower()}"
+    file_storage.save(file_path)
+    return file_path
+
+
+def serialize_report_item(report_key: str, row):
+    item = dict(row or {})
+    if not item:
+        return item
+    config = get_report_file_config(report_key)
+    created_at = item.get("created_at")
+    if created_at is not None and hasattr(created_at, "isoformat"):
+        item["created_at"] = created_at.isoformat()
+    if config and config.get("has_price") and item.get("price") is not None:
+        item["price"] = float(item["price"])
+    item_id = item.get("id")
+    file_path = get_report_item_file_path(report_key, item_id)
+    item["has_file"] = bool(file_path and file_path.exists())
+    item["file_name"] = f"{config['prefix']}_{item_id}{file_path.suffix.lower()}" if config and file_path else None
+    item["download_url"] = f"/api/report-files/{report_key}/{item_id}/download" if file_path else None
+    return item
+
+
+def fetch_report_item(conn, report_key: str, item_id: int):
+    config = get_report_file_config(report_key)
+    if not config:
+        return None
+    sql = (
+        f"SELECT {', '.join(config['select_columns'])} "
+        f"FROM {config['table']} "
+        "WHERE id = %s"
+    )
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, (item_id,))
+        return cur.fetchone()
+
+def get_client_ip(req: request) -> str:
+    """Return best-effort client IP, considering proxy headers."""
+    xff = req.headers.get('X-Forwarded-For', '')
+    if xff:
+        # X-Forwarded-For can be a comma-separated list. Take the first hop (original client)
+        return xff.split(',')[0].strip()
+    return req.headers.get('X-Real-IP') or req.remote_addr or 'unknown'
+
+def log_auth_event(username: str, action: str, ip: str):
+    """Insert a login/logout event into login_logs table.
+    Table schema expected:
+      id SERIAL PK,
+      username VARCHAR NOT NULL,
+      action   VARCHAR NOT NULL,  -- 'login' | 'logout'
+      ip       VARCHAR NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    """
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO login_logs (username, action, ip)
+                VALUES (%s, %s, %s)
+                """,
+                (username, action, ip),
+            )
+            conn.commit()
+        conn.close()
+    except Exception:
+        # Do not fail the main request if logging fails.
+        pass
+
+
+@app.route("/api/report-files/<report_key>", methods=["GET"])
+def list_report_files(report_key):
+    config = get_report_file_config(report_key)
+    if not config:
+        return jsonify({"error": "ไม่พบเมนูรายงานที่ต้องการ"}), 404
+
+    search = request.args.get("search", "", type=str).strip()
+    year_raw = request.args.get("year", type=str)
+    file_type = normalize_optional_text(request.args.get("file_type", type=str))
+    page = max(1, request.args.get("page", 1, type=int))
+    page_size = max(1, min(request.args.get("pageSize", 10, type=int), 200))
+    offset = (page - 1) * page_size
+
+    where = []
+    params = []
+
+    if search:
+        pattern = f"%{search}%"
+        where.append("(" + " OR ".join([f"{col} ILIKE %s" for col in config["search_columns"]]) + ")")
+        params.extend([pattern] * len(config["search_columns"]))
+
+    if year_raw not in (None, ""):
+        try:
+            year = parse_optional_int(year_raw, "year")
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        where.append("year = %s")
+        params.append(year)
+
+    if file_type:
+        if file_type not in {"pdf", "excel"}:
+            return jsonify({"error": "file_type ต้องเป็น pdf หรือ excel"}), 400
+        where.append("file_type = %s")
+        params.append(file_type)
+
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    select_sql = (
+        f"SELECT {', '.join(config['select_columns'])} "
+        f"FROM {config['table']}"
+        f"{where_sql} "
+        "ORDER BY year DESC NULLS LAST, created_at DESC, id DESC "
+        "LIMIT %s OFFSET %s"
+    )
+    count_sql = f"SELECT COUNT(*) FROM {config['table']}{where_sql}"
+
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(select_sql, [*params, page_size, offset])
+            rows = cur.fetchall()
+            cur.execute(count_sql, params)
+            count_row = cur.fetchone()
+            total = count_row.get("count") if isinstance(count_row, dict) else (count_row[0] if count_row else 0)
+        conn.close()
+        items = [serialize_report_item(report_key, row) for row in rows]
+        return jsonify({
+            "items": items,
+            "total": int(total),
+            "page": page,
+            "pageSize": page_size,
+            "title": config["title"],
+        }), 200
+    except Exception as e:
+        return jsonify({"error": "ไม่สามารถดึงข้อมูลรายงานได้", "detail": str(e)}), 500
+
+
+@app.route("/api/report-files/<report_key>", methods=["POST"])
+def create_report_file_item(report_key):
+    config = get_report_file_config(report_key)
+    if not config:
+        return jsonify({"error": "ไม่พบเมนูรายงานที่ต้องการ"}), 404
+
+    data = get_request_payload()
+    file_storage = request.files.get("file")
+
+    try:
+        detail = normalize_optional_text(data.get("detail"))
+        note = normalize_optional_text(data.get("note"))
+        year = parse_optional_int(data.get("year"), "year")
+        file_type, suffix = resolve_report_upload(file_storage, data.get("file_type"))
+        price = parse_optional_price(data.get("price")) if config.get("has_price") else None
+        item_type = normalize_optional_text(data.get("type")) if config.get("requires_type") else None
+        if config.get("requires_type") and item_type not in {"new", "renew"}:
+            raise ValueError("type ต้องเป็น new หรือ renew")
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    insert_columns = []
+    insert_values = []
+    if config.get("has_price"):
+        insert_columns.append("price")
+        insert_values.append(price)
+    if config.get("requires_type"):
+        insert_columns.append("type")
+        insert_values.append(item_type)
+    insert_columns.extend(["detail", "year", "file_type", "note"])
+    insert_values.extend([detail, year, file_type, note])
+
+    placeholders = ", ".join(["%s"] * len(insert_columns))
+    sql = (
+        f"INSERT INTO {config['table']} ({', '.join(insert_columns)}) "
+        f"VALUES ({placeholders}) "
+        f"RETURNING {', '.join(config['select_columns'])}"
+    )
+
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, insert_values)
+            row = cur.fetchone()
+            save_report_item_file(report_key, row["id"], file_storage, suffix)
+            conn.commit()
+        conn.close()
+        return jsonify({"item": serialize_report_item(report_key, row)}), 201
+    except Exception as e:
+        if "conn" in locals():
+            conn.rollback()
+            conn.close()
+        remove_report_item_file(report_key, row["id"] if "row" in locals() and row else None)
+        return jsonify({"error": "ไม่สามารถบันทึกข้อมูลรายงานได้", "detail": str(e)}), 500
+
+
+@app.route("/api/report-files/<report_key>/<int:item_id>", methods=["PUT"])
+def update_report_file_item(report_key, item_id):
+    config = get_report_file_config(report_key)
+    if not config:
+        return jsonify({"error": "ไม่พบเมนูรายงานที่ต้องการ"}), 404
+
+    data = get_request_payload()
+    file_storage = request.files.get("file")
+    updates = []
+    params = []
+
+    try:
+        if config.get("has_price") and "price" in data:
+            updates.append("price = %s")
+            params.append(parse_optional_price(data.get("price")))
+        if config.get("requires_type") and "type" in data:
+            item_type = normalize_optional_text(data.get("type"))
+            if item_type not in {"new", "renew"}:
+                raise ValueError("type ต้องเป็น new หรือ renew")
+            updates.append("type = %s")
+            params.append(item_type)
+        if "detail" in data:
+            updates.append("detail = %s")
+            params.append(normalize_optional_text(data.get("detail")))
+        if "year" in data:
+            updates.append("year = %s")
+            params.append(parse_optional_int(data.get("year"), "year"))
+        if "note" in data:
+            updates.append("note = %s")
+            params.append(normalize_optional_text(data.get("note")))
+
+        file_type = None
+        suffix = None
+        if file_storage and getattr(file_storage, "filename", ""):
+            file_type, suffix = resolve_report_upload(file_storage, data.get("file_type"))
+            updates.append("file_type = %s")
+            params.append(file_type)
+        elif "file_type" in data:
+            file_type = normalize_optional_text(data.get("file_type"))
+            if file_type not in {"pdf", "excel"}:
+                raise ValueError("file_type ต้องเป็น pdf หรือ excel")
+            updates.append("file_type = %s")
+            params.append(file_type)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    if not updates and not file_storage:
+        return jsonify({"error": "ไม่มีข้อมูลสำหรับอัปเดต"}), 400
+
+    sql = (
+        f"UPDATE {config['table']} "
+        f"SET {', '.join(updates)} "
+        "WHERE id = %s "
+        f"RETURNING {', '.join(config['select_columns'])}"
+    )
+
+    try:
+        conn = get_db_connection()
+        existing = fetch_report_item(conn, report_key, item_id)
+        if not existing:
+            conn.close()
+            return jsonify({"error": "ไม่พบข้อมูลที่ต้องการอัปเดต"}), 404
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, [*params, item_id])
+            row = cur.fetchone()
+            if file_storage and suffix:
+                save_report_item_file(report_key, item_id, file_storage, suffix)
+            conn.commit()
+        conn.close()
+        return jsonify({"item": serialize_report_item(report_key, row)}), 200
+    except Exception as e:
+        if "conn" in locals():
+            conn.rollback()
+            conn.close()
+        return jsonify({"error": "ไม่สามารถอัปเดตข้อมูลรายงานได้", "detail": str(e)}), 500
+
+
+@app.route("/api/report-files/<report_key>/<int:item_id>", methods=["DELETE"])
+def delete_report_file_item(report_key, item_id):
+    config = get_report_file_config(report_key)
+    if not config:
+        return jsonify({"error": "ไม่พบเมนูรายงานที่ต้องการ"}), 404
+
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(f"DELETE FROM {config['table']} WHERE id = %s", (item_id,))
+            deleted = cur.rowcount
+            conn.commit()
+        conn.close()
+        if deleted == 0:
+            return jsonify({"error": "ไม่พบข้อมูลที่ต้องการลบ"}), 404
+        remove_report_item_file(report_key, item_id)
+        return jsonify({"success": True}), 200
+    except Exception as e:
+        if "conn" in locals():
+            conn.rollback()
+            conn.close()
+        return jsonify({"error": "ไม่สามารถลบข้อมูลรายงานได้", "detail": str(e)}), 500
+
+
+@app.route("/api/report-files/<report_key>/<int:item_id>/download", methods=["GET"])
+def download_report_file_item(report_key, item_id):
+    config = get_report_file_config(report_key)
+    if not config:
+        return jsonify({"error": "ไม่พบเมนูรายงานที่ต้องการ"}), 404
+
+    try:
+        conn = get_db_connection()
+        row = fetch_report_item(conn, report_key, item_id)
+        conn.close()
+        if not row:
+            return jsonify({"error": "ไม่พบข้อมูลไฟล์ที่ต้องการ"}), 404
+
+        file_path = get_report_item_file_path(report_key, item_id)
+        if not file_path or not file_path.exists():
+            return jsonify({"error": "ไม่พบไฟล์ที่ต้องการดาวน์โหลด"}), 404
+
+        download_name = f"{config['prefix']}_{item_id}{file_path.suffix.lower()}"
+        return send_file(
+            file_path,
+            as_attachment=True,
+            download_name=download_name,
+            mimetype=mimetypes.guess_type(str(file_path))[0] or "application/octet-stream",
+        )
+    except Exception as e:
+        return jsonify({"error": "ไม่สามารถดาวน์โหลดไฟล์ได้", "detail": str(e)}), 500
+
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
+
+@app.route("/api/db/health", methods=["GET"])
+def db_health():
+    """Quick DB connectivity check: returns 200 if SELECT 1 succeeds."""
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1;")
+            row = cur.fetchone()
+        conn.close()
+        return jsonify({"db": "ok", "result": row[0]}), 200
+    except Exception as e:
+        # For troubleshooting, you may log e to console or a logger
+        return jsonify({"db": "down", "error": str(e)}), 500
+
+@app.route("/api/licenses", methods=["GET"])
+def get_licenses():
+    """Return license records from listLicense_O365.
+    Query params:
+      - q: optional search text (matches several columns ILIKE)
+      - limit: default 500
+      - offset: default 0
+    """
+    q = request.args.get('q', '', type=str).strip()
+    limit = request.args.get('limit', 500, type=int)
+    offset = request.args.get('offset', 0, type=int)
+
+    limit = max(1, min(limit, 5000))  # protect server
+    offset = max(0, offset)
+
+    # Joined view to include department and license names for DataTable
+    base_sql = (
+        "FROM listLicense_O365 l "
+        "LEFT JOIN departments d ON l.depart_id = d.depart_id "
+        "LEFT JOIN license_type t ON l.license_id = t.license_id"
+    )
+    select_cols = (
+        "SELECT "
+        " l.emp_id, "
+        " l.name_email, "
+        " t.license_name, "
+        " l.full_name, "
+        " l.disp_name, "
+        " l.nick_name, "
+        " d.depart_name, "
+        " l.cost_center, "
+        " l.depart_id, "
+        " l.license_id "
+    )
+    where_sql = ""
+    search_params = []
+
+    if q:
+        where_sql = (
+            " WHERE "
+            " l.emp_id::text ILIKE %s OR "
+            " l.full_name ILIKE %s OR "
+            " l.disp_name ILIKE %s OR "
+            " l.name_email ILIKE %s OR "
+            " d.depart_name ILIKE %s OR "
+            " t.license_name ILIKE %s OR "
+            " l.cost_center ILIKE %s OR "
+            " l.nick_name ILIKE %s OR "
+            " l.depart_id::text ILIKE %s OR "
+            " l.license_id::text ILIKE %s"
+        )
+        pattern = f"%{q}%"
+        search_params = [pattern] * 10
+
+    order_paging_sql = " ORDER BY l.emp_id LIMIT %s OFFSET %s"
+    params_rows = [*search_params, limit, offset]
+
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Fetch page of rows
+            cur.execute(select_cols + base_sql + where_sql + order_paging_sql, params_rows)
+            rows = cur.fetchall()
+            # Fetch total count under same filter
+            cur.execute("SELECT COUNT(*) " + base_sql + where_sql, search_params)
+            count_row = cur.fetchone()
+            # count_row can be a dict (RealDictCursor) or tuple depending on cursor
+            total = count_row.get("count") if isinstance(count_row, dict) else (count_row[0] if count_row else 0)
+        conn.close()
+        return jsonify({"items": rows, "total": int(total) if total is not None else len(rows)}), 200
+    except Exception as e:
+        return jsonify({"error": "ไม่สามารถดึงข้อมูลไลเซนส์ได้", "detail": str(e)}), 500
+
+@app.route("/api/licenses/update", methods=["POST"])
+def update_license():
+    """Update a record in listLicense_O365 by emp_id.
+    Expected JSON body keys:
+      emp_id (required), full_name, disp_name, name_email, depart_id, cost_center, license_id, nick_name
+    """
+    data = request.get_json(silent=True) or {}
+    emp_id = data.get('emp_id')
+    if emp_id in (None, ""):
+        return jsonify({"error": "ต้องระบุ emp_id"}), 400
+
+    fields = [
+        ('full_name', data.get('full_name')),
+        ('disp_name', data.get('disp_name')),
+        ('name_email', data.get('name_email')),
+        ('depart_id', data.get('depart_id')),
+        ('cost_center', data.get('cost_center')),
+        ('license_id', data.get('license_id')),
+        ('nick_name', data.get('nick_name')),
+    ]
+    # Build dynamic SET clause for only provided fields
+    set_clauses = []
+    params = []
+    for col, val in fields:
+        if val is not None:
+            set_clauses.append(f"{col} = %s")
+            params.append(val)
+
+    if not set_clauses:
+        return jsonify({"error": "ไม่มีข้อมูลสำหรับอัปเดต"}), 400
+
+    params.append(emp_id)
+    sql = f"UPDATE listLicense_O365 SET {', '.join(set_clauses)} WHERE emp_id = %s"
+
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            updated = cur.rowcount
+            conn.commit()
+        conn.close()
+
+        if updated == 0:
+            return jsonify({"error": "ไม่พบ emp_id ที่ต้องการอัปเดต"}), 404
+
+        return jsonify({"message": "อัปเดตสำเร็จ", "updated": int(updated)}), 200
+    except Exception as e:
+        return jsonify({"error": "ไม่สามารถอัปเดตข้อมูลได้", "detail": str(e)}), 500
+
+@app.route("/api/licenses/create", methods=["POST"])
+def create_license():
+    """Create a new record in listLicense_O365.
+    Expected JSON body keys:
+      emp_id (required), name_email (required), full_name, disp_name, depart_id, cost_center, license_id, nick_name
+    """
+    data = request.get_json(silent=True) or {}
+    emp_id = data.get('emp_id')
+    name_email = data.get('name_email')
+    if emp_id in (None, ""):
+        return jsonify({"error": "ต้องระบุ emp_id"}), 400
+    if name_email in (None, ""):
+        return jsonify({"error": "ต้องระบุอีเมล"}), 400
+
+    fields = []
+    values = []
+    params = []
+
+    def add_field(col, val):
+        if val is not None:
+            fields.append(col)
+            values.append('%s')
+            params.append(val)
+
+    add_field('emp_id', emp_id)
+    add_field('name_email', name_email)
+    add_field('full_name', data.get('full_name'))
+    add_field('disp_name', data.get('disp_name'))
+    add_field('depart_id', data.get('depart_id'))
+    add_field('cost_center', data.get('cost_center'))
+    add_field('license_id', data.get('license_id'))
+    add_field('nick_name', data.get('nick_name'))
+
+    if not fields:
+        return jsonify({"error": "ไม่มีข้อมูลสำหรับบันทึก"}), 400
+
+    sql = f"INSERT INTO listLicense_O365 ({', '.join(fields)}) VALUES ({', '.join(values)})"
+
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            conn.commit()
+        conn.close()
+        return jsonify({"message": "บันทึกสำเร็จ"}), 201
+    except Exception as e:
+        return jsonify({"error": "บันทึกไม่สำเร็จ", "detail": str(e)}), 500
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = (data.get("password") or "").strip()
+
+    if not username or not password:
+        return jsonify({"error": "กรุณากรอกชื่อผู้ใช้และรหัสผ่าน"}), 400
+
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # หมายเหตุ: ตัวอย่างนี้เปรียบเทียบรหัสผ่านแบบ plain text
+            # ในงานจริงควรเก็บและตรวจสอบรหัสผ่านแบบแฮช (เช่น bcrypt)
+            cur.execute(
+                """
+                SELECT username, password, display, role
+                FROM users_login
+                WHERE UPPER(username) = UPPER(%s)
+                LIMIT 1
+                """,
+                (username,),
+            )
+            row = cur.fetchone()
+
+        conn.close()
+
+        if not row or row["password"] != password:
+            return jsonify({"error": "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง"}), 401
+
+        # Log successful login
+        client_ip = get_client_ip(request)
+        log_auth_event(row["username"], "login", client_ip)
+
+        return jsonify({
+            "username": row["username"],
+            "display": row["display"],
+            "role": row["role"],
+        }), 200
+
+    except Exception as e:
+        # สำหรับ debug: สามารถพิมพ์ e ลง log ได้
+        return jsonify({"error": "เกิดข้อผิดพลาดของระบบ"}), 500
+
+
+@app.route("/api/departments", methods=["GET"])
+def get_departments():
+    """List departments with optional search and pagination.
+    Backward compatible with prior `q` and `limit` params.
+
+    Query params:
+      - search or q: filter by depart_id or depart_name (ILIKE)
+      - page: page number starting at 1 (default 1)
+      - pageSize: items per page (default 1000 if limit provided or 50)
+      - limit: legacy single-limit without paging
+    """
+    search = request.args.get('search', '', type=str).strip()
+    if not search:
+        search = request.args.get('q', '', type=str).strip()
+
+    page = request.args.get('page', type=int)
+    page_size = request.args.get('pageSize', type=int)
+    legacy_limit = request.args.get('limit', type=int)
+
+    where_sql = ""
+    params = []
+    if search:
+        where_sql = " WHERE depart_id::text ILIKE %s OR depart_name ILIKE %s"
+        pattern = f"%{search}%"
+        params = [pattern, pattern]
+
+    base_sql = "FROM departments"
+
+    # Legacy mode: only limit, no total
+    if page is None and page_size is None and legacy_limit is not None:
+        limit = max(1, min(legacy_limit, 5000))
+        sql = "SELECT depart_id, depart_name " + base_sql + where_sql + " ORDER BY depart_name LIMIT %s"
+        params_l = [*params, limit]
+        try:
+            conn = get_db_connection()
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, params_l)
+                rows = cur.fetchall()
+            conn.close()
+            return jsonify({"items": rows}), 200
+        except Exception as e:
+            return jsonify({"error": "ไม่สามารถดึงข้อมูลแผนกได้", "detail": str(e)}), 500
+
+    # Paged mode
+    page = page or 1
+    page_size = page_size or 50
+    page = max(1, page)
+    page_size = max(1, min(page_size, 500))
+    offset = (page - 1) * page_size
+
+    select_sql = "SELECT depart_id, depart_name " + base_sql + where_sql + " ORDER BY depart_name LIMIT %s OFFSET %s"
+    params_rows = [*params, page_size, offset]
+
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(select_sql, params_rows)
+            rows = cur.fetchall()
+            cur.execute("SELECT COUNT(*) " + base_sql + where_sql, params)
+            count_row = cur.fetchone()
+            total = count_row.get("count") if isinstance(count_row, dict) else (count_row[0] if count_row else 0)
+        conn.close()
+        return jsonify({"items": rows, "total": int(total), "page": page, "pageSize": page_size}), 200
+    except Exception as e:
+        return jsonify({"error": "ไม่สามารถดึงข้อมูลแผนกได้", "detail": str(e)}), 500
+
+
+@app.route("/api/departments", methods=["POST"])
+def create_department():
+    data = request.get_json(silent=True) or {}
+    depart_id = (str(data.get('depart_id') or '')).strip()
+    depart_name = (data.get('depart_name') or '').strip()
+    if not depart_id:
+        return jsonify({"error": "ต้องระบุ depart_id"}), 400
+    if not depart_name:
+        return jsonify({"error": "ต้องระบุ depart_name"}), 400
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO departments (depart_id, depart_name) VALUES (%s, %s)", (depart_id, depart_name))
+            conn.commit()
+        conn.close()
+        return jsonify({"item": {"depart_id": depart_id, "depart_name": depart_name}}), 201
+    except Exception as e:
+        return jsonify({"error": "บันทึกไม่สำเร็จ", "detail": str(e)}), 500
+
+
+@app.route("/api/departments/<depart_id>", methods=["PUT"])
+def update_department(depart_id):
+    data = request.get_json(silent=True) or {}
+    depart_name = (data.get('depart_name') or '').strip()
+    if not depart_name:
+        return jsonify({"error": "ต้องระบุ depart_name"}), 400
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("UPDATE departments SET depart_name = %s WHERE depart_id = %s", (depart_name, depart_id))
+            updated = cur.rowcount
+            conn.commit()
+        conn.close()
+        if updated == 0:
+            return jsonify({"error": "ไม่พบแผนกที่ต้องการอัปเดต"}), 404
+        return jsonify({"item": {"depart_id": depart_id, "depart_name": depart_name}}), 200
+    except Exception as e:
+        return jsonify({"error": "อัปเดตไม่สำเร็จ", "detail": str(e)}), 500
+
+
+@app.route("/api/departments/<depart_id>", methods=["DELETE"])
+def delete_department(depart_id):
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM departments WHERE depart_id = %s", (depart_id,))
+            deleted = cur.rowcount
+            conn.commit()
+        conn.close()
+        if deleted == 0:
+            return jsonify({"error": "ไม่พบแผนกที่ต้องการลบ"}), 404
+        return jsonify({"success": True}), 200
+    except Exception as e:
+        return jsonify({"error": "ลบไม่สำเร็จ", "detail": str(e)}), 500
+
+
+# Reports: Licenses with joins, optional department filter
+@app.route("/api/reports/licenses", methods=["GET"])
+def report_licenses():
+    """Return license list from listLicense_O365 joined with departments and license_type.
+    Optional filters:
+      - depart_id: exact match
+      - depart_name: ILIKE match
+      - q: search across emp_id, name_email, full_name, disp_name, nick_name, cost_center
+      - limit, offset
+    """
+    depart_id = request.args.get('depart_id', type=str)
+    depart_name = request.args.get('depart_name', type=str)
+    q = request.args.get('q', '', type=str).strip()
+    limit = max(1, min(request.args.get('limit', 5000, type=int), 20000))
+    offset = max(0, request.args.get('offset', 0, type=int))
+
+    where = []
+    params = []
+    if depart_id:
+        where.append("l.depart_id = %s")
+        params.append(depart_id)
+    if depart_name:
+        where.append("d.depart_name ILIKE %s")
+        params.append(f"%{depart_name}%")
+    if q:
+        pattern = f"%{q}%"
+        where.append("(l.emp_id::text ILIKE %s OR l.name_email ILIKE %s OR l.full_name ILIKE %s OR l.disp_name ILIKE %s OR l.nick_name ILIKE %s OR l.cost_center ILIKE %s)")
+        params.extend([pattern, pattern, pattern, pattern, pattern, pattern])
+
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    sql = (
+        "SELECT l.emp_id, l.name_email, t.license_name, l.full_name, l.disp_name, l.nick_name, d.depart_name, l.cost_center "
+        "FROM listLicense_O365 l "
+        "LEFT JOIN departments d ON l.depart_id = d.depart_id "
+        "LEFT JOIN license_type t ON l.license_id = t.license_id "
+        + where_sql +
+        " ORDER BY d.depart_name NULLS LAST, l.emp_id LIMIT %s OFFSET %s"
+    )
+
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, [*params, limit, offset])
+            rows = cur.fetchall()
+        conn.close()
+        return jsonify({"items": rows, "limit": limit, "offset": offset, "count": len(rows)}), 200
+    except Exception as e:
+        return jsonify({"error": "ไม่สามารถดึงข้อมูลรายงานได้", "detail": str(e)}), 500
+
+
+@app.route("/api/costcenters", methods=["GET"])
+def get_costcenters():
+    """List cost centers with optional search and pagination."""
+    search = request.args.get('search', '', type=str).strip()
+    page = max(1, request.args.get('page', 1, type=int))
+    page_size = max(1, min(request.args.get('pageSize', 50, type=int), 500))
+    offset = (page - 1) * page_size
+
+    where_sql = ""
+    params = []
+    if search:
+        where_sql = " WHERE cost_id::text ILIKE %s OR cost_name ILIKE %s"
+        pattern = f"%{search}%"
+        params = [pattern, pattern]
+
+    base_sql = "FROM costcenter"
+    select_sql = "SELECT cost_id, cost_name " + base_sql + where_sql + " ORDER BY cost_name LIMIT %s OFFSET %s"
+    params_rows = [*params, page_size, offset]
+
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(select_sql, params_rows)
+            rows = cur.fetchall()
+            cur.execute("SELECT COUNT(*) " + base_sql + where_sql, params)
+            count_row = cur.fetchone()
+            total = count_row.get("count") if isinstance(count_row, dict) else (count_row[0] if count_row else 0)
+        conn.close()
+        return jsonify({"items": rows, "total": int(total), "page": page, "pageSize": page_size}), 200
+    except Exception as e:
+        return jsonify({"error": "ไม่สามารถดึงข้อมูล Cost Center ได้", "detail": str(e)}), 500
+
+
+@app.route("/api/costcenters", methods=["POST"])
+def create_costcenter():
+    data = request.get_json(silent=True) or {}
+    cost_id = (str(data.get('cost_id') or '')).strip()
+    cost_name = (data.get('cost_name') or '').strip()
+    if not cost_id:
+        return jsonify({"error": "ต้องระบุ cost_id"}), 400
+    if not cost_name:
+        return jsonify({"error": "ต้องระบุ cost_name"}), 400
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO costcenter (cost_id, cost_name) VALUES (%s, %s)", (cost_id, cost_name))
+            conn.commit()
+        conn.close()
+        return jsonify({"item": {"cost_id": cost_id, "cost_name": cost_name}}), 201
+    except Exception as e:
+        return jsonify({"error": "บันทึกไม่สำเร็จ", "detail": str(e)}), 500
+
+
+@app.route("/api/costcenters/<cost_id>", methods=["PUT"])
+def update_costcenter(cost_id):
+    data = request.get_json(silent=True) or {}
+    cost_name = (data.get('cost_name') or '').strip()
+    if not cost_name:
+        return jsonify({"error": "ต้องระบุ cost_name"}), 400
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("UPDATE costcenter SET cost_name = %s WHERE cost_id = %s", (cost_name, cost_id))
+            updated = cur.rowcount
+            conn.commit()
+        conn.close()
+        if updated == 0:
+            return jsonify({"error": "ไม่พบ Cost Center ที่ต้องการอัปเดต"}), 404
+        return jsonify({"item": {"cost_id": cost_id, "cost_name": cost_name}}), 200
+    except Exception as e:
+        return jsonify({"error": "อัปเดตไม่สำเร็จ", "detail": str(e)}), 500
+
+
+@app.route("/api/costcenters/<cost_id>", methods=["DELETE"])
+def delete_costcenter(cost_id):
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM costcenter WHERE cost_id = %s", (cost_id,))
+            deleted = cur.rowcount
+            conn.commit()
+        conn.close()
+        if deleted == 0:
+            return jsonify({"error": "ไม่พบ Cost Center ที่ต้องการลบ"}), 404
+        return jsonify({"success": True}), 200
+    except Exception as e:
+        return jsonify({"error": "ลบไม่สำเร็จ", "detail": str(e)}), 500
+@app.route("/api/users_login", methods=["GET"])
+def list_users_login():
+    """List users with search and pagination."""
+    search = request.args.get('search', '', type=str).strip()
+    page = max(1, request.args.get('page', 1, type=int))
+    page_size = max(1, min(request.args.get('pageSize', 50, type=int), 500))
+    offset = (page - 1) * page_size
+
+    where_sql = ""
+    params = []
+    if search:
+        where_sql = " WHERE username ILIKE %s OR display ILIKE %s OR role ILIKE %s"
+        pattern = f"%{search}%"
+        params = [pattern, pattern, pattern]
+
+    base_sql = "FROM users_login"
+    select_sql = "SELECT username, display, role " + base_sql + where_sql + " ORDER BY username LIMIT %s OFFSET %s"
+    params_rows = [*params, page_size, offset]
+
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(select_sql, params_rows)
+            rows = cur.fetchall()
+            cur.execute("SELECT COUNT(*) " + base_sql + where_sql, params)
+            count_row = cur.fetchone()
+            total = count_row.get("count") if isinstance(count_row, dict) else (count_row[0] if count_row else 0)
+        conn.close()
+        return jsonify({"items": rows, "total": int(total), "page": page, "pageSize": page_size}), 200
+    except Exception as e:
+        return jsonify({"error": "ไม่สามารถดึงข้อมูลผู้ใช้ได้", "detail": str(e)}), 500
+
+
+@app.route("/api/users_login", methods=["POST"])
+def create_user_login():
+    data = request.get_json(silent=True) or {}
+    username = (data.get('username') or '').strip()
+    password = (data.get('password') or '').strip()
+    display = (data.get('display') or '').strip()
+    role = (data.get('role') or 'viewer').strip()
+    if not username:
+        return jsonify({"error": "ต้องระบุ username"}), 400
+    if not password or len(password) < 6:
+        return jsonify({"error": "รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร"}), 400
+    if not role:
+        role = 'viewer'
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users_login (username, password, display, role) VALUES (%s, %s, %s, %s)",
+                (username, password, display, role)
+            )
+            conn.commit()
+        conn.close()
+        return jsonify({"item": {"username": username, "display": display, "role": role}}), 201
+    except Exception as e:
+        return jsonify({"error": "บันทึกไม่สำเร็จ", "detail": str(e)}), 500
+
+
+@app.route("/api/users_login/<username>", methods=["PUT"])
+def update_user_login(username):
+    data = request.get_json(silent=True) or {}
+    display = (data.get('display') or '').strip()
+    role = (data.get('role') or '').strip()
+    password = (data.get('password') or '').strip()
+
+    if not display and not role and not password:
+        return jsonify({"error": "ไม่มีข้อมูลสำหรับอัปเดต"}), 400
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            set_parts = []
+            params = []
+            if display:
+                set_parts.append("display = %s")
+                params.append(display)
+            if role:
+                set_parts.append("role = %s")
+                params.append(role)
+            if password:
+                set_parts.append("password = %s")
+                params.append(password)
+            params.append(username)
+            sql = f"UPDATE users_login SET {', '.join(set_parts)} WHERE username = %s"
+            cur.execute(sql, params)
+            updated = cur.rowcount
+            conn.commit()
+        conn.close()
+        if updated == 0:
+            return jsonify({"error": "ไม่พบผู้ใช้ที่ต้องการอัปเดต"}), 404
+        return jsonify({"item": {"username": username, "display": display or None, "role": role or None}}), 200
+    except Exception as e:
+        return jsonify({"error": "อัปเดตไม่สำเร็จ", "detail": str(e)}), 500
+
+
+@app.route("/api/users_login/<username>", methods=["DELETE"])
+def delete_user_login(username):
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM users_login WHERE username = %s", (username,))
+            deleted = cur.rowcount
+            conn.commit()
+        conn.close()
+        if deleted == 0:
+            return jsonify({"error": "ไม่พบผู้ใช้ที่ต้องการลบ"}), 404
+        return jsonify({"success": True}), 200
+    except Exception as e:
+        return jsonify({"error": "ลบไม่สำเร็จ", "detail": str(e)}), 500
+
+
+@app.route("/api/license_types", methods=["GET"])
+def get_license_types():
+    """List license types with optional search and pagination.
+    Query params: search, page, pageSize
+    """
+    search = request.args.get('search', '', type=str).strip()
+    page = max(1, request.args.get('page', 1, type=int))
+    page_size = max(1, min(request.args.get('pageSize', 50, type=int), 500))
+    offset = (page - 1) * page_size
+
+    where_sql = ""
+    params = []
+    if search:
+        where_sql = " WHERE license_id::text ILIKE %s OR license_name ILIKE %s"
+        pattern = f"%{search}%"
+        params = [pattern, pattern]
+
+    base_sql = "FROM license_type"
+    select_sql = "SELECT license_id, license_name " + base_sql + where_sql + " ORDER BY license_name LIMIT %s OFFSET %s"
+    params_rows = [*params, page_size, offset]
+
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(select_sql, params_rows)
+            rows = cur.fetchall()
+            cur.execute("SELECT COUNT(*) " + base_sql + where_sql, params)
+            count_row = cur.fetchone()
+            total = count_row.get("count") if isinstance(count_row, dict) else (count_row[0] if count_row else 0)
+        conn.close()
+        return jsonify({"items": rows, "total": int(total), "page": page, "pageSize": page_size}), 200
+    except Exception as e:
+        return jsonify({"error": "ไม่สามารถดึงข้อมูลประเภทไลเซนส์ได้", "detail": str(e)}), 500
+
+
+@app.route("/api/license_types", methods=["POST"])
+def create_license_type():
+    data = request.get_json(silent=True) or {}
+    license_id = (str(data.get('license_id') or '')).strip()
+    license_name = (data.get('license_name') or '').strip()
+    if not license_id:
+        return jsonify({"error": "ต้องระบุ license_id"}), 400
+    if not license_name:
+        return jsonify({"error": "ต้องระบุ license_name"}), 400
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO license_type (license_id, license_name) VALUES (%s, %s)", (license_id, license_name))
+            conn.commit()
+        conn.close()
+        return jsonify({"item": {"license_id": license_id, "license_name": license_name}}), 201
+    except Exception as e:
+        return jsonify({"error": "บันทึกไม่สำเร็จ", "detail": str(e)}), 500
+
+
+@app.route("/api/license_types/<license_id>", methods=["PUT"])
+def update_license_type(license_id):
+    data = request.get_json(silent=True) or {}
+    license_name = (data.get('license_name') or '').strip()
+    if not license_name:
+        return jsonify({"error": "ต้องระบุ license_name"}), 400
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("UPDATE license_type SET license_name = %s WHERE license_id = %s", (license_name, license_id))
+            updated = cur.rowcount
+            conn.commit()
+        conn.close()
+        if updated == 0:
+            return jsonify({"error": "ไม่พบประเภทไลเซนส์ที่ต้องการอัปเดต"}), 404
+        return jsonify({"item": {"license_id": license_id, "license_name": license_name}}), 200
+    except Exception as e:
+        return jsonify({"error": "อัปเดตไม่สำเร็จ", "detail": str(e)}), 500
+
+
+@app.route("/api/license_types/<license_id>", methods=["DELETE"])
+def delete_license_type(license_id):
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM license_type WHERE license_id = %s", (license_id,))
+            deleted = cur.rowcount
+            conn.commit()
+        conn.close()
+        if deleted == 0:
+            return jsonify({"error": "ไม่พบประเภทไลเซนส์ที่ต้องการลบ"}), 404
+        return jsonify({"success": True}), 200
+    except Exception as e:
+        return jsonify({"error": "ลบไม่สำเร็จ", "detail": str(e)}), 500
+
+@app.route("/api/licenses/delete", methods=["POST"])
+def delete_license():
+    """Delete a record from listLicense_O365 by emp_id and email.
+    Expected JSON body keys:
+    - emp_id: Employee ID (required)
+    - email: Email address (required)
+    """
+    data = request.get_json(silent=True) or {}
+    emp_id = (data.get("emp_id") or "").strip()
+    email = (data.get("email") or "").strip()
+    
+    if not emp_id or not email:
+        return jsonify({"error": "ต้องระบุรหัสพนักงานและอีเมล"}), 400
+    
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Check if record exists
+        cursor.execute(
+            "SELECT emp_id, name_email FROM listLicense_O365 WHERE emp_id = %s AND name_email = %s",
+            (emp_id, email)
+        )
+        record = cursor.fetchone()
+        
+        if not record:
+            return jsonify({"error": "ไม่พบข้อมูลที่ต้องการลบ"}), 404
+            
+        # Delete the record
+        cursor.execute(
+            "DELETE FROM listLicense_O365 WHERE emp_id = %s AND name_email = %s",
+            (emp_id, email)
+        )
+        
+        if cursor.rowcount == 0:
+            return jsonify({"error": "ไม่สามารถลบข้อมูลได้"}), 500
+            
+        conn.commit()
+        return jsonify({"message": "ลบข้อมูลเรียบร้อยแล้ว"}), 200
+        
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": "ไม่สามารถลบข้อมูลได้", "detail": str(e)}), 500
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+@app.route("/api/logout", methods=["POST"])
+def logout():
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+
+    if not username:
+        return jsonify({"error": "กรุณากรอกชื่อผู้ใช้"}), 400
+
+    try:
+        # Log logout event
+        client_ip = get_client_ip(request)
+        log_auth_event(username, "logout", client_ip)
+
+        return jsonify({"message": "Logged out successfully"}), 200
+
+    except Exception as e:
+        # สำหรับ debug: สามารถพิมพ์ e ลง log ได้
+        return jsonify({"error": "เกิดข้อผิดพลาดของระบบ"}), 500
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=True)
